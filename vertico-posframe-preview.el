@@ -267,9 +267,15 @@ nil or 0 to disable the check."
                       (buffer-local-value 'vertico-posframe-preview-function buffer))
                      (content (and candidate
                                    (let ((vertico-posframe-preview--consult-buffer
-                                          (current-buffer)))
+                                          (current-buffer))
+                                         ;; consult--multi passes (cand . src)
+                                         ;; cons cells; extract the string part
+                                         ;; for the preview function.
+                                         (preview-cand (if (consp candidate)
+                                                           (car candidate)
+                                                         candidate)))
                                      (with-current-buffer buffer
-                                       (funcall preview-function candidate))))))
+                                       (funcall preview-function preview-cand))))))
                (vertico-posframe-preview--show-content buffer content)
              (posframe-hide vertico-posframe-preview--buffer)))
           ('exit
@@ -481,14 +487,16 @@ keeps sizes anchored to the user-visible Emacs frame."
     current))
 
 (defun vertico-posframe-preview--golden-ratio-size ()
-  "Return fixed candidate and preview sizes based on the Emacs frame."
+  "Return fixed candidate and preview sizes based on the Emacs frame.
+Subtracts border columns so both posframes fit in terminal."
   (when vertico-posframe-preview-golden-ratio-size
     (let* ((window (vertico-posframe-last-window))
            (raw-frame (if (window-live-p window)
                           (window-frame window)
                         (selected-frame)))
            (frame (vertico-posframe-preview--root-frame raw-frame))
-           (width (max 20 (frame-width frame)))
+           (border-cols (* 4 (or vertico-posframe-border-width 0)))
+           (width (max 20 (- (frame-width frame) border-cols)))
            (height (max 1 (frame-height frame)))
            (phi (/ (+ 1 (sqrt 5.0)) 2))
            (gap (min vertico-posframe-preview-golden-ratio-gap
@@ -527,25 +535,29 @@ keeps sizes anchored to the user-visible Emacs frame."
           minibuffer-completing-file-name))))
 
 (defun vertico-posframe-preview--apply-layout (buffer &optional content)
-  "Apply fixed preview layout variables to minibuffer BUFFER."
+  "Apply fixed preview layout variables to minibuffer BUFFER.
+Only applies golden-ratio height/count/position when a preview is
+available; otherwise lets vertico-posframe use its defaults."
   (when-let* ((size (vertico-posframe-preview--golden-ratio-size)))
     (with-current-buffer buffer
-      (let ((candidate-width (if (or content
-                                     (vertico-posframe-preview--preview-available-p))
-                                 (plist-get size :candidate-width)
-                               (plist-get size :full-width))))
-        (setq-local vertico-posframe-width candidate-width)
-        (setq-local vertico-posframe-min-width candidate-width))
-      (setq-local vertico-posframe-height
-                  (plist-get size :height))
-      (setq-local vertico-posframe-min-height
-                  (plist-get size :height))
-      (when vertico-posframe-preview-auto-count
-        (setq-local vertico-count
-                    (max 1 (1- (plist-get size :height)))))
-      (when vertico-posframe-preview-golden-ratio-position
-        (setq-local vertico-posframe-poshandler
-                    #'vertico-posframe-preview-poshandler-candidate)))))
+      (let ((has-preview (or content
+                             (vertico-posframe-preview--preview-available-p))))
+        (let ((candidate-width (if has-preview
+                                   (plist-get size :candidate-width)
+                                 (plist-get size :full-width))))
+          (setq-local vertico-posframe-width candidate-width)
+          (setq-local vertico-posframe-min-width candidate-width))
+        (when has-preview
+          (setq-local vertico-posframe-height
+                      (plist-get size :height))
+          (setq-local vertico-posframe-min-height
+                      (plist-get size :height))
+          (when vertico-posframe-preview-auto-count
+            (setq-local vertico-count
+                        (max 1 (1- (plist-get size :height)))))
+          (when vertico-posframe-preview-golden-ratio-position
+            (setq-local vertico-posframe-poshandler
+                        #'vertico-posframe-preview-poshandler-candidate)))))))
 
 (defun vertico-posframe-preview--set-size-advice (buffer &rest _)
   "Set fixed Vertico posframe size for BUFFER before it is shown."
@@ -733,11 +745,17 @@ nil when detection is disabled or the file is empty."
              "\n"))
 
 (defun vertico-posframe-preview--file-content (file)
-  "Return preview content for regular FILE."
+  "Return preview content for regular FILE.
+Uses `find-file-noselect' so font-lock faces are included."
   (unless (vertico-posframe-preview--binary-file-p file)
-    (with-temp-buffer
-      (insert-file-contents file nil 0 vertico-posframe-preview-max-size)
-      (buffer-string))))
+    (let ((buffer (find-file-noselect file t)))
+      (with-current-buffer buffer
+        (font-lock-ensure (point-min)
+                          (min (point-max)
+                               (+ (point-min) vertico-posframe-preview-max-size)))
+        (buffer-substring (point-min)
+                          (min (point-max)
+                               (+ (point-min) vertico-posframe-preview-max-size)))))))
 
 (defun vertico-posframe-preview--file-position-content (file position)
   "Return preview content for FILE around POSITION."
@@ -842,8 +860,11 @@ variables are handled the same way `find-file' would."
 (defun vertico-posframe-preview--position-content (point title matches)
   "Return preview content around POINT in the current buffer.
 TITLE is inserted above the preview when non-nil.
-MATCHES is a list of match begin/end pairs relative to POINT."
+MATCHES is a list of match begin/end pairs relative to POINT.
+Uses `buffer-substring' to preserve font-lock faces."
   (goto-char point)
+  (font-lock-ensure (line-beginning-position (- (car (vertico-posframe-preview--location-context-lines))))
+                    (line-end-position (1+ (cdr (vertico-posframe-preview--location-context-lines)))))
   (let* ((target-line-beg (line-beginning-position))
          (target-line-end (line-end-position))
          (line (line-number-at-pos point))
@@ -855,7 +876,7 @@ MATCHES is a list of match begin/end pairs relative to POINT."
       (goto-char point)
       (forward-line (1+ after-context))
       (let* ((end (line-beginning-position))
-             (content (buffer-substring-no-properties beg end))
+             (content (buffer-substring beg end))
              (target-offset (- point beg)))
         (vertico-posframe-preview--add-face
          content
